@@ -1,6 +1,9 @@
 import express from "express";
 import cors from "cors";
 import { pool } from "./db.js";
+import moviesRouter from "./routes/movies.routes.js";
+import ratingsRouter from "./routes/ratings.routes.js";
+import chatRouter from "./routes/chat.routes.js";
 
 const app = express();
 app.use(cors());
@@ -19,3 +22,7 @@ const port = process.env.PORT || 3000;
 app.listen(port, () =>
   console.log(`Server running on http://localhost:${port}`),
 );
+
+app.use("/api/movies", moviesRouter);
+app.use("/api/ratings", ratingsRouter);
+app.use("/api/chat", chatRouter);
