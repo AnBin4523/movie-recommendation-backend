@@ -4,6 +4,7 @@ import { pool } from "./db.js";
 import moviesRouter from "./routes/movies.routes.js";
 import ratingsRouter from "./routes/ratings.routes.js";
 import chatRouter from "./routes/chat.routes.js";
+import authRouter from "./routes/auth.routes.js";
 
 const app = express();
 app.use(cors());
@@ -26,3 +27,4 @@ app.listen(port, () =>
 app.use("/api/movies", moviesRouter);
 app.use("/api/ratings", ratingsRouter);
 app.use("/api/chat", chatRouter);
+app.use("/api/auth", authRouter);
