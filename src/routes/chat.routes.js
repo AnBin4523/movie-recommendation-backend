@@ -1,13 +1,15 @@
 import { Router } from "express";
 import { pool } from "../db.js";
+import { requireAuth } from "../middlewares/auth.js";
 
 const router = Router();
 
-// GET /api/chat/sessions?user_id=103007
-router.get("/sessions", async (req, res) => {
+// GET /api/chat/sessions  (logged-in user)
+router.get("/sessions", requireAuth, async (req, res) => {
   try {
-    const userId = Number(req.query.user_id);
-    if (!userId) return res.status(400).json({ message: "user_id is required" });
+    const userId = req.user.linked_user_id;
+    if (!userId)
+      return res.status(400).json({ message: "Account not linked_user_id" });
 
     const [rows] = await pool.query(
       `SELECT session_id, user_id, title, started_at, ended_at
@@ -15,7 +17,7 @@ router.get("/sessions", async (req, res) => {
        WHERE user_id=?
        ORDER BY started_at DESC
        LIMIT 50`,
-      [userId]
+      [userId],
     );
     res.json(rows);
   } catch (e) {
@@ -24,16 +26,27 @@ router.get("/sessions", async (req, res) => {
 });
 
 // GET /api/chat/sessions/:sessionId/messages
-router.get("/sessions/:sessionId/messages", async (req, res) => {
+router.get("/sessions/:sessionId/messages", requireAuth, async (req, res) => {
   try {
     const sessionId = Number(req.params.sessionId);
+    const userId = req.user.linked_user_id;
+
+    const [s] = await pool.query(
+      `SELECT session_id, user_id FROM chat_sessions WHERE session_id=?`,
+      [sessionId],
+    );
+    if (!s.length)
+      return res.status(404).json({ message: "Session not found" });
+    if (s[0].user_id !== Number(userId)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
     const [rows] = await pool.query(
       `SELECT message_id, role, content, created_at
        FROM chat_messages
        WHERE session_id=?
        ORDER BY created_at ASC`,
-      [sessionId]
+      [sessionId],
     );
     res.json(rows);
   } catch (e) {
@@ -41,37 +54,139 @@ router.get("/sessions/:sessionId/messages", async (req, res) => {
   }
 });
 
-// GET /api/chat/sessions/:sessionId/signals
-router.get("/sessions/:sessionId/signals", async (req, res) => {
-  try {
-    const sessionId = Number(req.params.sessionId);
+// GET /api/chat/sessions/:sessionId/recommendations
+router.get(
+  "/sessions/:sessionId/recommendations",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const sessionId = Number(req.params.sessionId);
+      const userId = req.user.linked_user_id;
+      const limit = Math.min(Number(req.query.limit || 20), 50);
 
-    const [rows] = await pool.query(
-      `SELECT signal_id, signal_type, signal_value, confidence, created_at
+      if (!userId)
+        return res.status(400).json({ message: "Account not linked_user_id" });
+
+      // 1) Check session belongs to user
+      const [s] = await pool.query(
+        `SELECT session_id, user_id FROM chat_sessions WHERE session_id=?`,
+        [sessionId],
+      );
+      if (!s.length)
+        return res.status(404).json({ message: "Session not found" });
+      if (s[0].user_id !== Number(userId))
+        return res.status(403).json({ message: "Forbidden" });
+
+      // 2) Load signals of session
+      const [sigRows] = await pool.query(
+        `SELECT signal_type, signal_value
        FROM chat_signals
        WHERE session_id=?
        ORDER BY created_at ASC`,
-      [sessionId]
-    );
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+        [sessionId],
+      );
 
-// POST /api/chat/sessions
-router.post("/sessions", async (req, res) => {
+      // 3) Parse signals
+      const likeGenres = [];
+      const dislikeGenres = [];
+      let yearMin = null;
+      let yearMax = null;
+
+      for (const r of sigRows) {
+        if (r.signal_type === "like_genre") likeGenres.push(r.signal_value);
+        if (r.signal_type === "dislike_genre")
+          dislikeGenres.push(r.signal_value);
+        if (r.signal_type === "year_min") yearMin = Number(r.signal_value);
+        if (r.signal_type === "year_max") yearMax = Number(r.signal_value);
+      }
+
+      // No signals: return top-rated movies
+      if (!likeGenres.length && !yearMin && !yearMax) {
+        const [rows] = await pool.query(
+          `SELECT movie_id, main_title, year_published, rate, genres
+         FROM movies
+         ORDER BY rate DESC
+         LIMIT ?`,
+          [limit],
+        );
+        return res.json({
+          basis: { likeGenres, dislikeGenres, yearMin, yearMax },
+          movies: rows,
+        });
+      }
+
+      // 4) Build dynamic SQL
+      const where = [];
+      const params = [];
+
+      // year filters
+      if (yearMin) {
+        where.push("m.year_published >= ?");
+        params.push(yearMin);
+      }
+      if (yearMax) {
+        where.push("m.year_published <= ?");
+        params.push(yearMax);
+      }
+
+      // include liked genres (OR)
+      if (likeGenres.length) {
+        const orParts = likeGenres.map(() => "m.genres LIKE ?");
+        where.push("(" + orParts.join(" OR ") + ")");
+        likeGenres.forEach((g) => params.push(`%${g}%`));
+      }
+
+      // exclude disliked genres (AND NOT)
+      if (dislikeGenres.length) {
+        dislikeGenres.forEach((g) => {
+          where.push("m.genres NOT LIKE ?");
+          params.push(`%${g}%`);
+        });
+      }
+
+      // avoid movies already rated by this user
+      where.push(
+        `NOT EXISTS (
+        SELECT 1 FROM ratings r
+        WHERE r.user_id = ? AND r.movie_id = m.movie_id
+      )`,
+      );
+      params.push(userId);
+
+      const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+      // 5) Query recommendations
+      const [movies] = await pool.query(
+        `SELECT m.movie_id, m.main_title, m.year_published, m.rate, m.genres
+       FROM movies m
+       ${whereSql}
+       ORDER BY m.rate DESC
+       LIMIT ?`,
+        [...params, limit],
+      );
+
+      return res.json({
+        basis: { likeGenres, dislikeGenres, yearMin, yearMax },
+        movies,
+      });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// POST /api/chat/sessions  (logged-in user)
+router.post("/sessions", requireAuth, async (req, res) => {
   try {
-    const { user_id, title } = req.body;
-    if (!user_id) return res.status(400).json({ message: "user_id is required" });
+    const userId = req.user.linked_user_id;
+    const { title } = req.body;
 
-    // check user exists 
-    const [u] = await pool.query(`SELECT user_id FROM users WHERE user_id=?`, [user_id]);
-    if (!u.length) return res.status(400).json({ message: "user_id not found" });
+    if (!userId)
+      return res.status(400).json({ message: "Account not linked_user_id" });
 
     const [result] = await pool.query(
       `INSERT INTO chat_sessions (user_id, title) VALUES (?, ?)`,
-      [user_id, title || "Chat session"]
+      [userId, title || "Chat session"],
     );
 
     res.status(201).json({ session_id: result.insertId });
@@ -88,19 +203,21 @@ function extractSignals(text) {
 
   // Detect like/dislike intent
   const like = /(^|\s)(like|love|enjoy|prefer)(\s|$)/i.test(original);
-  const dislike = /(^|\s)(dislike|hate|don't like|do not like)(\s|$)/i.test(original);
+  const dislike = /(^|\s)(dislike|hate|don't like|do not like)(\s|$)/i.test(
+    original,
+  );
 
   // Basic genre mapping (extend freely)
   const genreMap = [
-    { key: "action", value: "Action" },
-    { key: "sci-fi", value: "Sci-Fi" },
-    { key: "science fiction", value: "Sci-Fi" },
-    { key: "comedy", value: "Comedy" },
-    { key: "romance", value: "Romance" },
-    { key: "horror", value: "Horror" },
+    { key: "action", value: "Acción" },
+    { key: "sci-fi", value: "Ciencia ficción" },
+    { key: "science fiction", value: "Ciencia ficción" },
+    { key: "comedy", value: "Comedia" },
     { key: "drama", value: "Drama" },
     { key: "thriller", value: "Thriller" },
-    { key: "animation", value: "Animation" },
+    { key: "romance", value: "Romance" },
+    { key: "animation", value: "Animación" },
+    { key: "adventure", value: "Aventuras" },
   ];
 
   for (const g of genreMap) {
@@ -129,8 +246,7 @@ function extractSignals(text) {
 
   // year_max: "before 2010", "until 2010"
   const beforeMatch =
-    original.match(/before\s+(\d{4})/i) ||
-    original.match(/until\s+(\d{4})/i);
+    original.match(/before\s+(\d{4})/i) || original.match(/until\s+(\d{4})/i);
 
   if (beforeMatch) {
     signals.push({
@@ -151,13 +267,14 @@ function extractSignals(text) {
 }
 
 // POST /api/chat/sessions/:sessionId/messages
-router.post("/sessions/:sessionId/messages", async (req, res) => {
+router.post("/sessions/:sessionId/messages", requireAuth, async (req, res) => {
   try {
     const sessionId = Number(req.params.sessionId);
-    const { user_id, message } = req.body;
+    const userId = req.user?.linked_user_id;
+    const { message } = req.body;
 
-    if (!user_id || !message) {
-      return res.status(400).json({ message: "user_id and message are required" });
+    if (!userId || !message) {
+      return res.status(400).json({ message: "message is required" });
     }
 
     // 1) Validate session
@@ -167,8 +284,8 @@ router.post("/sessions/:sessionId/messages", async (req, res) => {
     );
     if (!s.length) return res.status(404).json({ message: "Session not found" });
 
-    // 2) Ensure session belongs to user (avoid writing to someone else's session)
-    if (s[0].user_id !== Number(user_id)) {
+    // 2) Ensure session belongs to logged-in user
+    if (s[0].user_id !== Number(userId)) {
       return res.status(403).json({ message: "Session does not belong to user" });
     }
 
@@ -176,24 +293,23 @@ router.post("/sessions/:sessionId/messages", async (req, res) => {
     const [msgResult] = await pool.query(
       `INSERT INTO chat_messages (session_id, user_id, role, content)
        VALUES (?, ?, 'user', ?)`,
-      [sessionId, user_id, message]
+      [sessionId, userId, message]
     );
     const messageId = msgResult.insertId;
 
-    // 4) Extract + insert signals
+    // 4) Extract + insert signals 
     const signals = extractSignals(message);
 
     if (signals.length) {
       const values = signals.map((sig) => [
         sessionId,
-        user_id,
+        userId,
         messageId,
         sig.signal_type,
         sig.signal_value,
         sig.confidence ?? null,
       ]);
 
-      // Bulk insert
       await pool.query(
         `INSERT INTO chat_signals
          (session_id, user_id, message_id, signal_type, signal_value, confidence)

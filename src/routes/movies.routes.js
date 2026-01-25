@@ -37,6 +37,54 @@ router.get("/", async (req, res) => {
   }
 });
 
+/**
+ * GET /api/movies/me?limit=20&offset=0&q=batman
+ * Require login
+ * Return: movie + my_rating (rating_score of logged in user)
+ */
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.linked_user_id;
+    if (!userId) {
+      return res.status(400).json({ message: "Account not linked_user_id" });
+    }
+
+    const limit = Math.min(Number(req.query.limit || 20), 100);
+    const offset = Number(req.query.offset || 0);
+    const q = (req.query.q || "").trim();
+
+    const params = [userId];
+
+    let sql = `
+      SELECT
+        m.movie_id,
+        m.main_title,
+        m.year_published,
+        m.rate AS global_rate,
+        m.genres,
+        r.rating_score AS my_rating,
+        r.rated_at AS my_rated_at
+      FROM movies m
+      LEFT JOIN ratings r
+        ON r.movie_id = m.movie_id
+       AND r.user_id = ?
+    `;
+
+    if (q) {
+      sql += ` WHERE m.main_title LIKE ? `;
+      params.push(`%${q}%`);
+    }
+
+    sql += ` ORDER BY m.movie_id LIMIT ? OFFSET ? `;
+    params.push(limit, offset);
+
+    const [rows] = await pool.query(sql, params);
+    return res.json(rows);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/movies/:id
 router.get("/:id", async (req, res) => {
   try {

@@ -2,59 +2,9 @@ import { Router } from "express";
 import { pool } from "../db.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { requireAuth } from "../middlewares/auth.js";
 
 const router = Router();
-
-/**
- * POST /api/auth/login
- */
-router.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "email and password are required" });
-    }
-
-    const [rows] = await pool.query(
-      `SELECT account_id, email, password_hash, role, linked_user_id, is_active
-       FROM app_accounts
-       WHERE email = ?`,
-      [email],
-    );
-
-    if (!rows.length)
-      return res.status(401).json({ message: "Invalid credentials" });
-
-    const acc = rows[0];
-    if (acc.is_active === 0)
-      return res.status(403).json({ message: "Account is inactive" });
-
-    const ok = await bcrypt.compare(password, acc.password_hash);
-    if (!ok) return res.status(401).json({ message: "Invalid credentials" });
-
-    const token = jwt.sign(
-      {
-        account_id: acc.account_id,
-        role: acc.role,
-        linked_user_id: acc.linked_user_id,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" },
-    );
-
-    return res.json({
-      account_id: acc.account_id,
-      email: acc.email,
-      role: acc.role,
-      linked_user_id: acc.linked_user_id,
-      token,
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
 
 function isValidEmail(email) {
   return /^\S+@\S+\.\S+$/.test(email);
@@ -201,6 +151,38 @@ router.post("/login", async (req, res) => {
       role: acc.role,
       linked_user_id: acc.linked_user_id,
       token,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * GET /api/auth/me
+ * Header: Authorization: Bearer <token>
+ */
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const { account_id } = req.user;
+
+    // Verify account still exists and is active
+    const [rows] = await pool.query(
+      `SELECT account_id, email, role, linked_user_id, is_active
+       FROM app_accounts
+       WHERE account_id = ?
+       LIMIT 1`,
+      [account_id]
+    );
+
+    if (!rows.length) return res.status(401).json({ message: "Account not found" });
+    const acc = rows[0];
+    if (acc.is_active === 0) return res.status(403).json({ message: "Account is inactive" });
+
+    return res.json({
+      account_id: acc.account_id,
+      email: acc.email,
+      role: acc.role,
+      linked_user_id: acc.linked_user_id,
     });
   } catch (e) {
     return res.status(500).json({ error: e.message });
