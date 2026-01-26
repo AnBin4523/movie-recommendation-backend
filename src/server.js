@@ -11,10 +11,10 @@ app.use(cors());
 app.use(express.json());
 
 // health check
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 // test DB connection
-app.get("/db-test", async (req, res) => {
+app.get("/api/db-test", async (req, res) => {
   const [rows] = await pool.query("SELECT 1 AS ok");
   res.json(rows[0]);
 });
